@@ -15,6 +15,7 @@ class CoolifyManager:
             "Accept": "application/json"
         } if token else {}
         self.resources = []
+        self.pending_deletions = set()  # UUIDs deleted but not yet gone from API
 
     def save_session(self, url, token):
         with open(CONFIG_FILE, 'w') as f:
@@ -38,8 +39,13 @@ class CoolifyManager:
 
             apps = [{"type": "applications", **a} for a in apps_res.json()]
             services = [{"type": "services", **s} for s in services_res.json()]
-            
-            self.resources = apps + services
+
+            all_resources = apps + services
+            fetched_uuids = {r['uuid'] for r in all_resources}
+            # Clear UUIDs that are now confirmed gone from the API
+            self.pending_deletions -= (self.pending_deletions - fetched_uuids)
+            # Hide resources still being deleted (async deletion in progress)
+            self.resources = [r for r in all_resources if r['uuid'] not in self.pending_deletions]
             return self.resources
         except Exception as e:
             print(f"\n❌ Connection Error: {e}")
@@ -63,9 +69,21 @@ class CoolifyManager:
         
         try:
             resp = requests.request(method, url, headers=self.headers, params=params)
-            return resp.status_code in [200, 201, 204]
-        except:
-            return False
+            if resp.status_code in [200, 201, 204]:
+                return True, None
+            # Try to extract a readable error from the response body
+            try:
+                body = resp.json()
+                message = body.get("message") or body.get("error") or json.dumps(body)
+            except ValueError:
+                message = resp.text.strip() or f"HTTP {resp.status_code}"
+            return False, f"HTTP {resp.status_code}: {message}"
+        except requests.exceptions.ConnectionError:
+            return False, "Connection failed — check your Coolify URL"
+        except requests.exceptions.Timeout:
+            return False, "Request timed out"
+        except Exception as e:
+            return False, str(e)
 
     def stream_logs(self, resource):
         res_type = resource['type']
@@ -154,8 +172,13 @@ def main():
                 
                 for res in selected:
                     print(f"Executing {action.upper()} on {res.get('name')}... ", end="", flush=True)
-                    success = manager.execute_action(res, action)
-                    print("✅" if success else "❌")
+                    success, error = manager.execute_action(res, action)
+                    if success:
+                        print("✅")
+                        if action == 'delete':
+                            manager.pending_deletions.add(res['uuid'])
+                    else:
+                        print(f"❌  {error}")
                 time.sleep(1.5)
         except Exception as e:
             print(f"Error: {e}")
