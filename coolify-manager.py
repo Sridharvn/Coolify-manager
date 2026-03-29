@@ -85,6 +85,67 @@ class CoolifyManager:
         except Exception as e:
             return False, str(e)
 
+    def find_empty_projects(self):
+        try:
+            resp = requests.get(f"{self.base_url}/api/v1/projects", headers=self.headers)
+            resp.raise_for_status()
+            projects = resp.json()
+        except Exception as e:
+            print(f"❌ Failed to fetch projects: {e}")
+            return []
+
+        # Resource keys returned by the environment detail endpoint
+        resource_keys = ['applications', 'services', 'postgresqls', 'mysqls', 'mariadbs', 'mongodbs', 'redis']
+
+        empty = []
+        for project in projects:
+            try:
+                # Fetch environments list for the project
+                proj_detail = requests.get(
+                    f"{self.base_url}/api/v1/projects/{project['uuid']}",
+                    headers=self.headers
+                )
+                proj_detail.raise_for_status()
+                environments = proj_detail.json().get('environments') or []
+
+                total_resources = 0
+                for env in environments:
+                    # The project detail endpoint does NOT include resources —
+                    # must call the environment detail endpoint for real counts
+                    env_detail = requests.get(
+                        f"{self.base_url}/api/v1/projects/{project['uuid']}/{env['name']}",
+                        headers=self.headers
+                    )
+                    if env_detail.status_code != 200:
+                        continue
+                    env_data = env_detail.json()
+                    total_resources += sum(len(env_data.get(k) or []) for k in resource_keys)
+
+                if total_resources == 0:
+                    empty.append(project)
+            except Exception:
+                continue
+        return empty
+
+    def delete_project(self, uuid):
+        url = f"{self.base_url}/api/v1/projects/{uuid}"
+        try:
+            resp = requests.delete(url, headers=self.headers)
+            if resp.status_code in [200, 201, 204]:
+                return True, None
+            try:
+                body = resp.json()
+                message = body.get("message") or body.get("error") or json.dumps(body)
+            except ValueError:
+                message = resp.text.strip() or f"HTTP {resp.status_code}"
+            return False, f"HTTP {resp.status_code}: {message}"
+        except requests.exceptions.ConnectionError:
+            return False, "Connection failed — check your Coolify URL"
+        except requests.exceptions.Timeout:
+            return False, "Request timed out"
+        except Exception as e:
+            return False, str(e)
+
     def stream_logs(self, resource):
         res_type = resource['type']
         uuid = resource['uuid']
@@ -144,11 +205,29 @@ def main():
             status = res.get('status', 'n/a')
             print(f"[{i:<2}] | {res['type'].upper():<12} | {name:<25} | {status:<15}")
 
-        print("\nCommands: [numbers] Select | [all] Select All | [q] Quit")
+        print("\nCommands: [numbers] Select | [all] Select All | [clean] Remove empty projects | [q] Quit")
         cmd = input("Input: ").strip().lower()
 
         if cmd == 'q': break
-        
+
+        if cmd == 'clean':
+            print("\nScanning for projects with no resources...")
+            empty = manager.find_empty_projects()
+            if not empty:
+                print("✅ No empty projects found.")
+                time.sleep(1.5)
+                continue
+            print(f"\nFound {len(empty)} empty project(s):")
+            for p in empty:
+                print(f"  • {p.get('name') or p['uuid']} (uuid: {p['uuid']})")
+            if input("\nDelete all of these projects? (y/n): ").lower() == 'y':
+                for p in empty:
+                    print(f"Deleting project '{p.get('name') or p['uuid']}'... ", end="", flush=True)
+                    success, error = manager.delete_project(p['uuid'])
+                    print("✅" if success else f"❌  {error}")
+            time.sleep(1.5)
+            continue
+
         try:
             indices = range(len(resources)) if cmd == 'all' else [int(x.strip()) for x in cmd.split(',')]
             selected = [resources[i] for i in indices if 0 <= i < len(resources)]
