@@ -1,0 +1,2 @@
+# HTTP library for API interaction
+requests>=2.31.0
